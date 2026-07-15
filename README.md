@@ -32,7 +32,7 @@
 
 ```bash
 pip install -r requirements.txt
-# opencood 框架需单独从 GitHub 安装： pip install git+https://github.com/DerrickXuNu/OpenCOOD.git
+# opencood 框架需单独从 GitHub 安装： pip install git https://github.com/DerrickXuNu/OpenCOOD.git
 ```
 
 ### 编译 Cython 扩展
