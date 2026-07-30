@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-高级可视化系统 — 四种攻击 × 多算法对比（论文级图表）
+高级可视化系统 — 多攻击 × 多算法对比（论文级图表）
 
 输出：
   - comparison_<attack>.png      单攻击综合面板
-  - cross_attack_summary.png     四攻击横向对比
+  - cross_attack_summary.png     跨攻击横向对比
   - metrics_heatmap.png          算法×攻击热力图
-  - reputation_gallery.png       四攻击信誉曲线画廊
+  - reputation_gallery.png       信誉曲线画廊
   - improvement_radar.png        改进效果雷达图
 """
 
@@ -81,6 +81,7 @@ ATTACK_META = {
     "drift": {"title": "Ghost Drift", "zh": "Drift", "color": "#2980B9"},
     "reverse": {"title": "Ghost Reverse", "zh": "Reverse", "color": "#27AE60"},
     "brake": {"title": "Brake Burst", "zh": "Brake Fraud", "color": "#8E44AD"},
+    "obstacle": {"title": "Static Obstacle", "zh": "Obstacle", "color": "#D35400"},
 }
 
 HARD_THR = 0.50
@@ -100,6 +101,8 @@ def short_name(scenario: str, result: Optional[Dict] = None) -> str:
         "reverse": "reverse",
         "brake_burst": "brake",
         "brake": "brake",
+        "static_obstacle": "obstacle",
+        "obstacle": "obstacle",
     }
     for key, val in mapping.items():
         if key in scenario:
@@ -601,10 +604,12 @@ class AdvancedVisualizer:
             return
 
         n = len(scenarios)
-        fig, axes = plt.subplots(2, 2, figsize=(16, 11), facecolor="#FAFBFC")
-        axes = axes.flatten()
+        ncols = 2
+        nrows = int(np.ceil(n / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(16, 5.5 * nrows), facecolor="#FAFBFC")
+        axes = np.array(axes).reshape(-1)
 
-        for i, sc in enumerate(scenarios[:4]):
+        for i, sc in enumerate(scenarios):
             ax = axes[i]
             results = self.results[sc]
             if not results:
@@ -615,7 +620,7 @@ class AdvancedVisualizer:
             fs, fe = self._attack_window(results[0])
             ax.axvspan(fs, fe, alpha=0.12, color=meta["color"])
 
-            for algo in ["ImprovedDRAMBR", "DRAMBR"]:
+            for algo in ["ImprovedDRAMBR", "DRAMBR", "PlexeMDS"]:
                 curves = []
                 for res in results:
                     adv = set(res["adversary_ids"])
@@ -628,11 +633,11 @@ class AdvancedVisualizer:
                 arr = np.array([c[:L] for c in curves])
                 mean, std = arr.mean(0), arr.std(0)
                 x = np.arange(L)
+                ls = "-" if algo == "ImprovedDRAMBR" else ("--" if algo == "DRAMBR" else ":")
                 ax.plot(x, mean, color=self.colors[algo],
-                        lw=2.5 if algo == "ImprovedDRAMBR" else 1.8,
-                        ls="-" if algo == "ImprovedDRAMBR" else "--",
-                        label=algo)
-                ax.fill_between(x, mean - std, mean + std, color=self.colors[algo], alpha=0.15)
+                        lw=2.5 if algo == "ImprovedDRAMBR" else 1.6,
+                        ls=ls, label=algo)
+                ax.fill_between(x, mean - std, mean + std, color=self.colors[algo], alpha=0.12)
 
             ax.axhline(HARD_THR, color="#1C2833", ls=":", lw=1.1)
             ax.set_ylim(-0.05, 1.08)
@@ -642,10 +647,10 @@ class AdvancedVisualizer:
             ax.set_ylabel("Attacker Reputation")
             ax.legend(fontsize=8, loc="upper right")
 
-        for j in range(len(scenarios), 4):
+        for j in range(n, len(axes)):
             axes[j].axis("off")
 
-        fig.suptitle("Attacker Reputation Drop Across Four Attacks",
+        fig.suptitle("Attacker Reputation Drop Across Attacks (data-driven obs)",
                      fontsize=15, fontweight="bold", color="#1C2833")
         fig.tight_layout(rect=[0, 0, 1, 0.95])
         out = self.output_dir / "reputation_gallery.png"

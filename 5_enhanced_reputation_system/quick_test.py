@@ -20,13 +20,14 @@ if not (current / "run_complete_experiment.py").exists():
     sys.exit(1)
 
 print("\n正在运行快速测试...")
-print("- 场景数: 4 (teleport / drift / reverse / brake)")
-print("- Episodes: 每个场景2个")
-print("- 预计时间: 15-25分钟\n")
+print("- 场景: teleport / drift / reverse / brake / obstacle")
+print("- Episodes: DataSet 每场景 1 个；obstacle 为独立 episode_0000")
+print("- 观测: 数据驱动四维接口\n")
 
 # 运行实验
 print("[1/2] 运行实验...")
-os.environ["EPISODES"] = "2"
+os.environ["EPISODES"] = "1"
+os.environ["SCENARIOS"] = "teleport,drift,reverse,brake,obstacle"
 os.system("python run_complete_experiment.py")
 
 # 生成可视化

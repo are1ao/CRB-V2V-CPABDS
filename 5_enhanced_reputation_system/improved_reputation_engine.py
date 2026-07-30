@@ -40,9 +40,9 @@ except ImportError:
 @dataclass
 class TrustVector:
     """三维信任向量"""
-    direct: float = 0.5
-    indirect: float = 0.5
-    global_trust: float = 0.5
+    direct: float = 1.0  # ✅ 修复：初始信任
+    indirect: float = 1.0  # ✅ 修复：初始信任
+    global_trust: float = 1.0  # ✅ 修复：初始信任
 
     def fused_score(self, weights: Tuple[float, float, float] = (0.55, 0.35, 0.10)) -> float:
         w_d, w_i, w_g = weights
@@ -52,7 +52,7 @@ class TrustVector:
 @dataclass
 class VehicleReputationMeta:
     """车辆信誉元数据"""
-    score: float = 0.5
+    score: float = 1.0  # ✅ 修复：初始信任
     variance: float = 0.0
     update_count: int = 0
     consistency_history: deque = field(default_factory=lambda: deque(maxlen=50))
@@ -67,7 +67,7 @@ class VehicleReputationMeta:
 @dataclass
 class ReputationConfig:
     """信誉配置参数"""
-    default_reputation: float = 0.5
+    default_reputation: float = 1.0  # ✅ 修复：初始信任所有车辆
     positive_step: float = 0.05
     negative_step: float = 0.1
     min_reputation: float = 0.0
@@ -85,7 +85,7 @@ class ReputationConfig:
     adaptive_count_factor: float = 0.05
     
     suspicious_threshold: float = 0.45
-    anomaly_threshold: float = 0.3
+    anomaly_threshold: float = 0.5  # ✅ 修复：低于 0.5 判定为异常
     fusion_filter_threshold: float = 0.3
     
     # 改进5: 多级过滤阈值
@@ -217,6 +217,8 @@ class ImprovedReputationManager:
     def _get_meta(self, vehicle_id: str) -> VehicleReputationMeta:
         if vehicle_id not in self._vehicles:
             m = VehicleReputationMeta(score=self.config.default_reputation)
+            m.trust_vector.direct = self.config.default_reputation  # ✅ 修复
+            m.trust_vector.indirect = self.config.default_reputation  # ✅ 修复
             m.trust_vector.global_trust = self.config.default_reputation
             self._vehicles[vehicle_id] = m
         return self._vehicles[vehicle_id]
@@ -298,9 +300,13 @@ class ImprovedReputationManager:
                 meta.high_reputation_streak += 1
         
         if is_consistent:
-            step_increase = min(1.0, current + step)
-            new_score = self.config.ewma_beta * current + self.config.ewma_alpha * step_increase
+            # ✅ 关键修复：正常车辆应该保持稳定，不应持续上升
+            # 使用固定稳态值 1.0 作为目标，而非 consistency_ratio
+            # 正常车会在 0.9-1.0 之间稳定（略低于初始值是合理的）
+            target_stable = 1.0
+            new_score = self.config.ewma_beta * current + self.config.ewma_alpha * target_stable
         else:
+            # 异常行为：降低信誉
             effective_step = step * first_offense_penalty
             new_score = max(self.config.min_reputation, current - effective_step)
             tv_penalty = meta.trust_vector.fused_score()
