@@ -2,9 +2,19 @@
 """Overlap-field voting for detection-level trust updates."""
 
 import numpy as np
-import sys  # 添加这个导入
+import sys
+from typing import List, Dict, Tuple, Optional
+
+# ✅ 新增：导入空间冲突检测模块
+from physical_consistency import (
+    detect_spatial_collusion,
+    compute_visibility_weights,
+    get_suspicious_vehicles,
+    get_visibility_weights
+)
 
 
+# ========== 核心投票器 ==========
 class OverlapFieldVoter:
     """Cluster 2D detections with score-reputation weighted voting."""
 
@@ -22,35 +32,56 @@ class OverlapFieldVoter:
     @staticmethod
     def calculate_iou(box1, box2):
         """Calculate IoU between two 2D boxes [x1, y1, x2, y2]."""
-        # 直接计算，假设输入已经是数值类型
         x1 = max(box1[0], box2[0])
         y1 = max(box1[1], box2[1])
         x2 = min(box1[2], box2[2])
         y2 = min(box1[3], box2[3])
         
         inter_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        # 面积直接计算，不需要max（因为框本身是有效的）
         area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
         area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
         union = area1 + area2 - inter_area
         
         return inter_area / union if union > 0.0 else 0.0
 
+    @staticmethod
+    def apply_gradient_weighting(reputation):
+        """
+        应用梯度降权逻辑（共谋防御：低信誉车辆被排除）
+        
+        Args:
+            reputation: 原始信誉值 (0-1)
+            
+        Returns:
+            float: 应用梯度降权后的权重系数
+        """
+        rep_weight = max(reputation, 0.0) ** 2
+        
+        if reputation < 0.5:
+            return 0.0
+        elif reputation < 0.7:
+            t = (reputation - 0.5) / (0.7 - 0.5)
+            gradient_factor = 0.2 + t * 0.3
+            return rep_weight * gradient_factor
+        elif reputation < 0.85:
+            t = (reputation - 0.7) / (0.85 - 0.7)
+            gradient_factor = 0.5 + t * 0.5
+            return rep_weight * gradient_factor
+        else:
+            return rep_weight
+
     def vote_detection_level(self, boxes_list, scores_list, labels_list,
                              reputation_scores=None):
-        # ✅ 新增：输入验证
-        # 检查是否为空
+        """核心投票融合函数（生成共识参考）"""
         if not boxes_list:
             return self.empty_output()
         
-        # 检查三个列表长度是否一致
         if not (len(boxes_list) == len(scores_list) == len(labels_list)):
             raise ValueError(
                 f"boxes_list, scores_list, labels_list must have same length. "
                 f"Got {len(boxes_list)}, {len(scores_list)}, {len(labels_list)}"
             )
         
-        # 检查信誉分长度是否匹配
         if reputation_scores is not None and len(reputation_scores) != len(boxes_list):
             raise ValueError(
                 f"reputation_scores length ({len(reputation_scores)}) "
@@ -61,10 +92,16 @@ class OverlapFieldVoter:
         for agent_idx, boxes in enumerate(boxes_list):
             reputation = 1.0 if reputation_scores is None else \
                 float(reputation_scores[agent_idx])
+            
+            rep_weight = self.apply_gradient_weighting(reputation)
+            
+            if rep_weight <= 0.0:
+                continue
+
             for box_idx, box in enumerate(boxes):
                 score = float(scores_list[agent_idx][box_idx])
                 label = int(labels_list[agent_idx][box_idx])
-                weight = score * max(reputation, 0.0)
+                weight = score * rep_weight
                 if weight <= self.skip_box_thr + sys.float_info.epsilon:
                     continue
                 flattened.append({
@@ -121,17 +158,66 @@ class OverlapFieldVoter:
             np.asarray(fused_labels, dtype=np.int32)
 
 
+# ========== 自适应阈值计算工具函数 ==========
+def calculate_adaptive_threshold(num_detections: int, reputation: float) -> float:
+    """
+    根据检测框数量和信誉值计算自适应匹配率阈值
+    
+    参数：
+        num_detections: 这辆车检测到了多少个目标
+        reputation: 这辆车的当前信誉值 (0-1)
+    
+    返回：
+        float: 调整后的阈值 (范围控制在0.35-0.85之间)
+    
+    逻辑说明：
+        1. 检测框越少 → 阈值越低（考虑领头车视野受限）
+        2. 信誉越高 → 阈值越低（历史表现好，值得信任）
+        3. 信誉越低 → 阈值越高（历史有问题，严格审查）
+    """
+    # 第一步：根据检测数量确定基础阈值
+    if num_detections <= 3:
+        base_threshold = 0.5
+    elif num_detections <= 5:
+        base_threshold = 0.6
+    else:
+        base_threshold = 0.7
+    
+    # 第二步：根据信誉值计算调节因子
+    if reputation >= 0.7:
+        factor = 1.0 - (reputation - 0.7) / 0.3 * 0.15
+    elif reputation >= 0.4:
+        factor = 1.0
+    else:
+        factor = 1.0 + (0.4 - reputation) / 0.4 * 0.3
+    
+    # 第三步：计算最终阈值
+    final_threshold = base_threshold * factor
+    
+    # 第四步：限制阈值范围
+    if final_threshold < 0.35:
+        final_threshold = 0.35
+    if final_threshold > 0.85:
+        final_threshold = 0.85
+    
+    return final_threshold
+
+
+# ========== 主系统类 ==========
 class OverlapFieldVotingSystem:
     """Build voting consensus and check leave-one-out consistency."""
 
     def __init__(self, iou_thr=0.5, skip_box_thr=1e-4,
-                 min_reference_agents=1, min_matched_boxes=1):
+                 min_reference_agents=1, min_matched_boxes=1,
+                 enable_collusion_detection=True):
         self.voter = OverlapFieldVoter(iou_thr=iou_thr,
                                        skip_box_thr=skip_box_thr)
         self.min_reference_agents = int(min_reference_agents)
         self.min_matched_boxes = int(min_matched_boxes)
+        self.enable_collusion_detection = enable_collusion_detection
 
     def fuse(self, detections_dict):
+        """数据准备与融合"""
         agent_ids = list(detections_dict.keys())
         reputations = [detections_dict[agent_id].get('reputation', 1.0)
                        for agent_id in agent_ids]
@@ -144,26 +230,36 @@ class OverlapFieldVotingSystem:
         return self.voter.vote_detection_level(boxes_list, scores_list,
                                                labels_list, reputations)
 
-    def compute_consistency_leave_one_out(self, detections_dict, iou_thr=0.5):
-        """Evaluate each agent against consensus formed without itself.
-
-        Returns
-        -------
-        dict
-            ``agent_id -> bool | None``. ``None`` means there is no reference
-            detection set, so the caller should not update that agent's
-            reputation for this frame.
-        """
+    def compute_consistency_leave_one_out(self, detections_dict, iou_thr=0.5,
+                                          ego_position=None):
+        """简化接口：返回每辆车的一致性判断"""
         details = self.compute_consistency_details(detections_dict,
-                                                   iou_thr=iou_thr)
+                                                   iou_thr=iou_thr,
+                                                   ego_position=ego_position)
         return {
             agent_id: item['consistent']
             for agent_id, item in details.items()
+            if agent_id != '_collusion'
         }
 
-    def compute_consistency_details(self, detections_dict, iou_thr=0.5):
-        """Return leave-one-out consistency and debug metadata."""
+    def compute_consistency_details(self, detections_dict, iou_thr=0.5,
+                                     ego_position=None):
+        """
+        Return leave-one-out consistency and debug metadata.
+        
+        新增参数：
+            ego_position: 自车位置 (x, y, z)，用于空间冲突检测
+        """
+        # 空间冲突检测
+        collusion_result = None
+        if self.enable_collusion_detection and ego_position is not None:
+            collusion_result = detect_spatial_collusion(
+                detections_dict, 
+                ego_position
+            )
+        
         details = {}
+        
         for target_id, target_det in detections_dict.items():
             reference_detections = {
                 agent_id: detections
@@ -171,6 +267,7 @@ class OverlapFieldVotingSystem:
                 if agent_id != target_id
             }
             reference_count = len(reference_detections)
+            
             if reference_count < self.min_reference_agents:
                 details[target_id] = {
                     'consistent': None,
@@ -183,9 +280,34 @@ class OverlapFieldVotingSystem:
                 continue
 
             fused_reference = self.fuse(reference_detections)
+            
+            # 获取目标车辆的视野权重
+            visibility_weight = 1.0
+            if self.enable_collusion_detection and ego_position is not None:
+                target_positions = []
+                for box in target_det.get('boxes', []):
+                    center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+                    target_positions.append(center)
+                if target_positions:
+                    vis_weights = compute_visibility_weights(
+                        {target_id: target_det}, 
+                        target_positions
+                    )
+                    visibility_weight = vis_weights.get(target_id, 1.0)
+            
+            target_reputation = target_det.get('reputation', 1.0)
+            
             details[target_id] = self.compare_to_fused_details(
-                target_det, fused_reference, iou_thr=iou_thr)
+                target_det, fused_reference, iou_thr=iou_thr,
+                target_reputation=target_reputation,
+                visibility_weight=visibility_weight,
+                reference_count=reference_count  # ✅ 新增：传入参考车辆数量
+            )
             details[target_id]['reference_agent_count'] = reference_count
+        
+        if collusion_result:
+            details['_collusion'] = collusion_result
+        
         return details
 
     def compare_to_fused(self, detections, fused_output, iou_thr=0.5):
@@ -195,11 +317,22 @@ class OverlapFieldVotingSystem:
             fused_output,
             iou_thr=iou_thr)['consistent']
 
-    def compare_to_fused_details(self, detections, fused_output, iou_thr=0.5):
-        """Return consistency plus matched/unmatched debug counts."""
+    def compare_to_fused_details(self, detections, fused_output, iou_thr=0.5,
+                              target_reputation=1.0,
+                              visibility_weight=1.0,
+                              reference_count=0):
+        """
+        Return consistency plus matched/unmatched debug counts.
+        
+        新增参数：
+            target_reputation: 被评估车辆的当前信誉值，用于自适应阈值计算
+            visibility_weight: 视野权重（来自空间验证模块），直接降低匹配率
+            reference_count: 参考车辆数量
+        """
         fused_boxes, _, fused_labels = fused_output
         boxes = detections.get('boxes', [])
         labels = detections.get('labels', [])
+        
         if len(fused_boxes) == 0 or len(boxes) == 0:
             return {
                 'consistent': False,
@@ -207,10 +340,14 @@ class OverlapFieldVotingSystem:
                 'matched_boxes': 0,
                 'unmatched_boxes': len(boxes),
                 'consistency_ratio': 0.0,
+                'adaptive_threshold': 0.0,
+                'target_reputation': target_reputation,
+                'visibility_weight': visibility_weight,
+                'num_detections': len(boxes),
             }
 
         matched = 0
-        label_matched = 0  # 改名，更清晰
+        label_matched = 0
         for box_idx, box in enumerate(boxes):
             label = labels[box_idx] if box_idx < len(labels) else None
             best_idx = None
@@ -226,26 +363,69 @@ class OverlapFieldVotingSystem:
             if label == fused_labels[best_idx]:
                 label_matched += 1
 
-        unmatched = len(boxes) - matched
-        # ✅ 修复：用"匹配率" = 匹配数量 / 总检测数
-        match_ratio = float(matched) / float(len(boxes)) if len(boxes) > 0 else 0.0
-        # 额外提供标签匹配率（调试用）
+        num_detections = len(boxes)
+        match_ratio = float(matched) / float(num_detections) if num_detections > 0 else 0.0
         label_ratio = float(label_matched) / float(matched) if matched > 0 else 0.0
 
+        # ========== 核心修复：视野权重直接降低匹配率 ==========
+        # 视野权重0.1（几乎看不到）→ 匹配率打6折
+        # 视野权重0.5（勉强看到）→ 匹配率打8折
+        # 视野权重0.8（基本看到）→ 匹配率打9.5折
+        # 视野权重1.0（完全可见）→ 匹配率不变
+        if visibility_weight < 0.2:
+            match_ratio_penalty = 0.5 + 0.5 * visibility_weight  # 0.1→0.55, 0.2→0.60
+        elif visibility_weight < 0.4:
+            match_ratio_penalty = 0.6 + 0.5 * (visibility_weight - 0.2)  # 0.2→0.60, 0.4→0.70
+        elif visibility_weight < 0.6:
+            match_ratio_penalty = 0.7 + 0.5 * (visibility_weight - 0.4)  # 0.4→0.70, 0.6→0.80
+        elif visibility_weight < 0.8:
+            match_ratio_penalty = 0.8 + 0.75 * (visibility_weight - 0.6)  # 0.6→0.80, 0.8→0.95
+        else:
+            match_ratio_penalty = 0.95 + 0.25 * (visibility_weight - 0.8)  # 0.8→0.95, 1.0→1.00
+        
+        # 应用惩罚后的有效匹配率
+        effective_match_ratio = match_ratio * match_ratio_penalty
+        
+        # 自适应阈值（基于检测数和信誉）
+        adaptive_threshold = calculate_adaptive_threshold(
+            num_detections=num_detections,
+            reputation=target_reputation
+        )
+        
+        # 参考车辆数量微调
+        if reference_count <= 2 and adaptive_threshold < 0.6:
+            adaptive_threshold = min(0.6, adaptive_threshold * 1.05)
+        
+        # 判断一致性：用有效匹配率去比较阈值
         if matched < self.min_matched_boxes:
-            return {
-                'consistent': False,
-                'reason': 'insufficient_matched_boxes',
-                'matched_boxes': matched,
-                'unmatched_boxes': unmatched,
-                'consistency_ratio': match_ratio,  # ✅ 用匹配率
-                'label_consistency': label_ratio,  # ✅ 新增标签一致性
-            }
+            consistent = False
+            reason = 'insufficient_matched_boxes'
+        else:
+            consistent = (effective_match_ratio >= adaptive_threshold)
+            reason = 'matched' if consistent else 'threshold_not_met'
+
         return {
-            'consistent': match_ratio > 0.7,  # ✅ 用匹配率判断
-            'reason': 'matched',
+            'consistent': consistent,
+            'reason': reason,
             'matched_boxes': matched,
-            'unmatched_boxes': unmatched,
-            'consistency_ratio': match_ratio,
+            'unmatched_boxes': num_detections - matched,
+            'consistency_ratio': match_ratio,  # 原始匹配率
+            'effective_match_ratio': effective_match_ratio,  # ✅ 视野惩罚后的匹配率
+            'match_ratio_penalty': match_ratio_penalty,  # ✅ 惩罚系数
             'label_consistency': label_ratio,
+            'adaptive_threshold': adaptive_threshold,
+            'target_reputation': target_reputation,
+            'visibility_weight': visibility_weight,
+            'num_detections': num_detections,
+            'reference_count': reference_count,
         }
+
+    # ========== 对外接口（供jy调用） ==========
+    
+    def get_suspicious_vehicles(self, detections_dict, ego_position) -> List:
+        """接口：hx → jy（疑似共谋车辆）"""
+        return get_suspicious_vehicles(detections_dict, ego_position)
+    
+    def get_visibility_weights(self, detections_dict, target_positions) -> Dict:
+        """接口：hx → jy（视野权重）"""
+        return get_visibility_weights(detections_dict, target_positions)
