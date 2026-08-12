@@ -203,18 +203,89 @@ def calculate_adaptive_threshold(num_detections: int, reputation: float) -> floa
     return final_threshold
 
 
+# ========== 辅助函数：物理视野过滤器 ==========
+def filter_detections_by_visibility(target_position: Tuple,
+                                     agent_det: Dict,
+                                     max_visible_distance: float = 200.0) -> Dict:
+    """
+    根据目标车辆的位置，过滤参考车辆中在物理上不可见的检测框。
+    
+    参数：
+        target_position: 被评估车辆的位置 (x, y, z)
+        agent_det: 参考车辆的检测数据，包含 boxes, scores, labels, position
+        max_visible_distance: 最大可视距离（米），默认200m
+    
+    返回：
+        Dict: 过滤后的检测数据，只包含目标车辆物理上能看到的检测框
+    """
+    agent_boxes = agent_det.get('boxes', np.array([]))
+    
+    # ✅ 修复：使用 len() 判断而非直接对数组做布尔判断
+    if len(agent_boxes) == 0:
+        return {
+            'boxes': np.array([]),
+            'scores': np.array([]),
+            'labels': np.array([]),
+            'position': agent_det.get('position', (0, 0, 0)),
+            'reputation': agent_det.get('reputation', 1.0)
+        }
+    
+    agent_scores = agent_det.get('scores', np.array([]))
+    agent_labels = agent_det.get('labels', np.array([]))
+    
+    valid_boxes = []
+    valid_scores = []
+    valid_labels = []
+    
+    target_pos = np.array(target_position[:2])
+    
+    for i, box in enumerate(agent_boxes):
+        # 计算检测框中心点（世界坐标）
+        center_x = (box[0] + box[2]) / 2
+        center_y = (box[1] + box[3]) / 2
+        center = np.array([center_x, center_y])
+        
+        # 计算距离
+        distance = np.linalg.norm(target_pos - center)
+        
+        # 如果距离超过最大可视距离，过滤掉这个检测框
+        if distance > max_visible_distance:
+            continue
+        
+        # 通过检查，保留该检测框
+        valid_boxes.append(box)
+        if i < len(agent_scores):
+            valid_scores.append(agent_scores[i])
+        else:
+            valid_scores.append(1.0)
+        if i < len(agent_labels):
+            valid_labels.append(agent_labels[i])
+        else:
+            valid_labels.append(0)
+    
+    return {
+        'boxes': np.array(valid_boxes) if valid_boxes else np.array([]),
+        'scores': np.array(valid_scores) if valid_scores else np.array([]),
+        'labels': np.array(valid_labels) if valid_labels else np.array([]),
+        'position': agent_det.get('position', (0, 0, 0)),
+        'reputation': agent_det.get('reputation', 1.0)
+    }
+
+
 # ========== 主系统类 ==========
 class OverlapFieldVotingSystem:
     """Build voting consensus and check leave-one-out consistency."""
 
     def __init__(self, iou_thr=0.5, skip_box_thr=1e-4,
                  min_reference_agents=1, min_matched_boxes=1,
-                 enable_collusion_detection=True):
+                 enable_collusion_detection=True,
+                 max_visible_distance=200.0):
         self.voter = OverlapFieldVoter(iou_thr=iou_thr,
                                        skip_box_thr=skip_box_thr)
         self.min_reference_agents = int(min_reference_agents)
         self.min_matched_boxes = int(min_matched_boxes)
         self.enable_collusion_detection = enable_collusion_detection
+        self.max_visible_distance = float(max_visible_distance)
 
     def fuse(self, detections_dict):
         """数据准备与融合"""
@@ -222,7 +293,7 @@ class OverlapFieldVotingSystem:
         reputations = [detections_dict[agent_id].get('reputation', 1.0)
                        for agent_id in agent_ids]
         boxes_list = [detections_dict[agent_id]['boxes']
-                      for agent_id in agent_ids]
+                       for agent_id in agent_ids]
         scores_list = [detections_dict[agent_id]['scores']
                        for agent_id in agent_ids]
         labels_list = [detections_dict[agent_id]['labels']
@@ -261,49 +332,61 @@ class OverlapFieldVotingSystem:
         details = {}
         
         for target_id, target_det in detections_dict.items():
-            reference_detections = {
-                agent_id: detections
-                for agent_id, detections in detections_dict.items()
-                if agent_id != target_id
-            }
-            reference_count = len(reference_detections)
+            # 获取被评估车辆的位置
+            target_position = target_det.get('position', (0, 0, 0))
+            
+            # ============================================================
+            # 核心修改：基于物理视野约束构建参考集
+            # 对于每一辆参考车辆，只保留目标车辆物理上能看到的检测框
+            # ============================================================
+            filtered_reference_detections = {}
+            
+            for agent_id, agent_det in detections_dict.items():
+                if agent_id == target_id:
+                    continue
+                
+                # 过滤掉目标车辆看不到的检测框
+                filtered_agent_det = filter_detections_by_visibility(
+                    target_position=target_position,
+                    agent_det=agent_det,
+                    max_visible_distance=self.max_visible_distance
+                )
+                
+                # 如果该参考车辆过滤后仍有有效检测框，则加入参考集
+                if len(filtered_agent_det.get('boxes', [])) > 0:
+                    filtered_reference_detections[agent_id] = filtered_agent_det
+            
+            reference_count = len(filtered_reference_detections)
             
             if reference_count < self.min_reference_agents:
                 details[target_id] = {
                     'consistent': None,
-                    'reason': 'insufficient_reference_agents',
+                    'reason': 'insufficient_reference_agents_after_visibility_filter',
                     'reference_agent_count': reference_count,
                     'matched_boxes': 0,
                     'unmatched_boxes': len(target_det.get('boxes', [])),
                     'consistency_ratio': None,
+                    'filtered_reference_agents': list(filtered_reference_detections.keys()),
                 }
                 continue
 
-            fused_reference = self.fuse(reference_detections)
-            
-            # 获取目标车辆的视野权重
-            visibility_weight = 1.0
-            if self.enable_collusion_detection and ego_position is not None:
-                target_positions = []
-                for box in target_det.get('boxes', []):
-                    center = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
-                    target_positions.append(center)
-                if target_positions:
-                    vis_weights = compute_visibility_weights(
-                        {target_id: target_det}, 
-                        target_positions
-                    )
-                    visibility_weight = vis_weights.get(target_id, 1.0)
+            # 使用过滤后的参考集进行融合
+            fused_reference = self.fuse(filtered_reference_detections)
             
             target_reputation = target_det.get('reputation', 1.0)
             
+            # 注意：visibility_weight 在这里不再用于惩罚目标车辆
+            # 因为已经在构建参考集时过滤了物理上不可见的检测框
             details[target_id] = self.compare_to_fused_details(
                 target_det, fused_reference, iou_thr=iou_thr,
                 target_reputation=target_reputation,
-                visibility_weight=visibility_weight,
-                reference_count=reference_count  # ✅ 新增：传入参考车辆数量
+                visibility_weight=1.0,
+                reference_count=reference_count
             )
             details[target_id]['reference_agent_count'] = reference_count
+            details[target_id]['filtered_reference_agents'] = list(
+                filtered_reference_detections.keys()
+            )
         
         if collusion_result:
             details['_collusion'] = collusion_result
@@ -324,9 +407,9 @@ class OverlapFieldVotingSystem:
         """
         Return consistency plus matched/unmatched debug counts.
         
-        新增参数：
+        参数：
             target_reputation: 被评估车辆的当前信誉值，用于自适应阈值计算
-            visibility_weight: 视野权重（来自空间验证模块），直接降低匹配率
+            visibility_weight: 视野权重（当前已不再用于惩罚，保留为1.0）
             reference_count: 参考车辆数量
         """
         fused_boxes, _, fused_labels = fused_output
@@ -367,25 +450,6 @@ class OverlapFieldVotingSystem:
         match_ratio = float(matched) / float(num_detections) if num_detections > 0 else 0.0
         label_ratio = float(label_matched) / float(matched) if matched > 0 else 0.0
 
-        # ========== 核心修复：视野权重直接降低匹配率 ==========
-        # 视野权重0.1（几乎看不到）→ 匹配率打6折
-        # 视野权重0.5（勉强看到）→ 匹配率打8折
-        # 视野权重0.8（基本看到）→ 匹配率打9.5折
-        # 视野权重1.0（完全可见）→ 匹配率不变
-        if visibility_weight < 0.2:
-            match_ratio_penalty = 0.5 + 0.5 * visibility_weight  # 0.1→0.55, 0.2→0.60
-        elif visibility_weight < 0.4:
-            match_ratio_penalty = 0.6 + 0.5 * (visibility_weight - 0.2)  # 0.2→0.60, 0.4→0.70
-        elif visibility_weight < 0.6:
-            match_ratio_penalty = 0.7 + 0.5 * (visibility_weight - 0.4)  # 0.4→0.70, 0.6→0.80
-        elif visibility_weight < 0.8:
-            match_ratio_penalty = 0.8 + 0.75 * (visibility_weight - 0.6)  # 0.6→0.80, 0.8→0.95
-        else:
-            match_ratio_penalty = 0.95 + 0.25 * (visibility_weight - 0.8)  # 0.8→0.95, 1.0→1.00
-        
-        # 应用惩罚后的有效匹配率
-        effective_match_ratio = match_ratio * match_ratio_penalty
-        
         # 自适应阈值（基于检测数和信誉）
         adaptive_threshold = calculate_adaptive_threshold(
             num_detections=num_detections,
@@ -396,12 +460,12 @@ class OverlapFieldVotingSystem:
         if reference_count <= 2 and adaptive_threshold < 0.6:
             adaptive_threshold = min(0.6, adaptive_threshold * 1.05)
         
-        # 判断一致性：用有效匹配率去比较阈值
+        # 判断一致性：直接用原始匹配率比较阈值
         if matched < self.min_matched_boxes:
             consistent = False
             reason = 'insufficient_matched_boxes'
         else:
-            consistent = (effective_match_ratio >= adaptive_threshold)
+            consistent = (match_ratio >= adaptive_threshold)
             reason = 'matched' if consistent else 'threshold_not_met'
 
         return {
@@ -409,9 +473,7 @@ class OverlapFieldVotingSystem:
             'reason': reason,
             'matched_boxes': matched,
             'unmatched_boxes': num_detections - matched,
-            'consistency_ratio': match_ratio,  # 原始匹配率
-            'effective_match_ratio': effective_match_ratio,  # ✅ 视野惩罚后的匹配率
-            'match_ratio_penalty': match_ratio_penalty,  # ✅ 惩罚系数
+            'consistency_ratio': match_ratio,
             'label_consistency': label_ratio,
             'adaptive_threshold': adaptive_threshold,
             'target_reputation': target_reputation,
